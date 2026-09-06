@@ -133,6 +133,8 @@ def _smooth(probability: np.ndarray, window: int = 11) -> np.ndarray:
 
 
 def _video_paths(root: Path) -> list[Path]:
+    if not root.is_dir():
+        raise FileNotFoundError(f"Stage 3 video directory not found: {root}")
     extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     return sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in extensions)
 
@@ -154,6 +156,9 @@ def predict_stage3(data_dir, model_dir):
     model.to(device).eval()
     mean = np.asarray(checkpoint["motion_mean"], dtype=np.float32)
     std = np.asarray(checkpoint["motion_std"], dtype=np.float32)
+    if mean.shape != (len(MOTION_FEATURES),) or std.shape != (len(MOTION_FEATURES),):
+        raise ValueError("Stage 3 checkpoint normalization shape is invalid")
+    std = np.maximum(np.abs(std), 1e-6)
     context = int(checkpoint["window_samples"])
     rows = []
 

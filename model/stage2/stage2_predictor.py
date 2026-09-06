@@ -24,14 +24,14 @@ OUTPUT_COLUMNS = [
 
 
 def frame_number(path: Path) -> int:
-    match = re.search(r"(\d+)$", path.stem)
-    return int(match.group(1)) if match else 0
+    matches = re.findall(r"\d+", path.stem)
+    return int(matches[-1]) if matches else 0
 
 
 def sorted_frame_paths(folder: Path) -> list[Path]:
     return sorted(
         (path for path in folder.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES),
-        key=frame_number,
+        key=lambda path: (frame_number(path), path.name.lower()),
     )
 
 
@@ -310,9 +310,12 @@ class YoloPBackend:
             # Development workspace layout.
             yolop_root = self.model_dir / "YOLOP-main" / "YOLOP-main"
         sys.path.insert(0, str(yolop_root))
-        from lib.config import cfg
-        from lib.core.general import non_max_suppression
-        from lib.models import get_net
+        try:
+            from lib.config import cfg
+            from lib.core.general import non_max_suppression
+            from lib.models import get_net
+        finally:
+            sys.path.remove(str(yolop_root))
 
         self.non_max_suppression = non_max_suppression
         # CUDA can report as available while all devices are masked (for
@@ -563,7 +566,10 @@ class Stage2Predictor:
             from ego_lane_geometry import EgoLaneBoundaryTracker
         except ImportError:
             sys.path.insert(0, str(self.model_dir))
-            from ego_lane_geometry import EgoLaneBoundaryTracker
+            try:
+                from ego_lane_geometry import EgoLaneBoundaryTracker
+            finally:
+                sys.path.remove(str(self.model_dir))
         self.boundary_tracker_type = EgoLaneBoundaryTracker
 
     def predict_folder(self, folder: Path) -> tuple[dict[str, object], dict[str, Any]]:
@@ -625,6 +631,8 @@ class Stage2Predictor:
 
     def predict(self, data_dir: Path) -> pd.DataFrame:
         image_root = Path(data_dir) / "images"
+        if not image_root.is_dir():
+            raise FileNotFoundError(f"Stage 2 image directory not found: {image_root}")
         folders = sorted(path for path in image_root.iterdir() if path.is_dir())
         rows = [self.predict_folder(folder)[0] for folder in folders]
         return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
