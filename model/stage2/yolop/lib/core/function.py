@@ -6,7 +6,10 @@ from lib.utils import plot_img_and_mask,plot_one_box,show_seg_result
 import torch
 from threading import Thread
 import numpy as np
-from PIL import Image
+try:
+    from PIL import Image
+except ModuleNotFoundError:
+    Image = None
 from torchvision import transforms
 from pathlib import Path
 import json
