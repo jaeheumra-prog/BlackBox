@@ -8,6 +8,7 @@ causal evidence of a physical screen recapture.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -20,11 +21,18 @@ EPS = 1e-6
 
 @dataclass(frozen=True)
 class FeatureConfig:
+    # 한 영상에서 뽑을 대표 프레임 수. 제출 추론에서는 시간 제한 때문에 2로 줄인다.
     frames: int = 24
+    # 화면 전체가 아니라 여러 위치의 패치를 잘라 재촬영 흔적을 비교한다.
     patch_size: int = 192
+    # 2차원 FFT를 계산할 때 사용할 정사각형 크기.
     fft_size: int = 128
+    # 시간 특징을 계산할 때 영상을 축소할 가로 크기.
     temporal_width: int = 320
+    # 현재 선택된 체크포인트에서는 False이다. 기능 자체는 남아 있다.
     use_temporal: bool = True
+    # 학습 기본값은 5개 패치이며, 제출 추론에서는 중앙 패치 1개만 사용한다.
+    patches: int = 5
 
 
 def _safe_stats(values: np.ndarray) -> tuple[float, float, float, float]:
@@ -40,7 +48,7 @@ def _safe_stats(values: np.ndarray) -> tuple[float, float, float, float]:
 
 
 def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
-    """Decode approximately uniform BGR frames without trusting video metadata."""
+    """영상 전체를 메모리에 올리지 않고 대표 BGR 프레임만 읽는다."""
 
     path = Path(path)
     capture = cv2.VideoCapture(str(path))
@@ -50,16 +58,14 @@ def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     frames: list[np.ndarray] = []
     if 0 < total <= 300:
+        # Random access is faster for the short clips used by the evaluator;
+        # sequentially decoding every unused frame was the main Stage 1 cost.
         wanted = np.linspace(0, max(0, total - 1), min(count, total)).round().astype(int)
-        wanted_set = set(wanted.tolist())
-        index = 0
-        while True:
+        for index in wanted:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
             ok, frame = capture.read()
-            if not ok:
-                break
-            if index in wanted_set:
+            if ok:
                 frames.append(frame)
-            index += 1
     elif total > 300:
         wanted = np.linspace(0, total - 1, count).round().astype(int)
         for index in wanted:
@@ -110,20 +116,43 @@ def _one_dimensional_peak(profile: np.ndarray) -> float:
         return 0.0
     return float(np.quantile(spectrum, 0.98) / (np.mean(spectrum) + EPS))
 
-
-def _spectral_metrics(channel: np.ndarray, fft_size: int) -> list[float]:
-    channel = cv2.resize(channel, (fft_size, fft_size), interpolation=cv2.INTER_AREA)
-    channel = channel.astype(np.float32)
-    residual = channel - cv2.GaussianBlur(channel, (0, 0), 2.0)
+@lru_cache(maxsize=4)
+def _fft_geometry(fft_size: int):
+    """FFT 크기별 window와 주파수 mask를 한 번만 계산한다."""
     window = np.hanning(fft_size).astype(np.float32)
-    spectrum = np.abs(np.fft.fftshift(np.fft.fft2(residual * window[:, None] * window[None, :])))
-    spectrum = np.log1p(spectrum)
-
     fy, fx = np.mgrid[-0.5:0.5:complex(fft_size), -0.5:0.5:complex(fft_size)]
     radius = np.sqrt(fx * fx + fy * fy)
     mid_mask = (radius >= 0.04) & (radius < 0.20)
     high_mask = (radius >= 0.20) & (radius < 0.46)
     valid_mask = mid_mask | high_mask
+    axis_mask = valid_mask & (
+        (np.abs(fx) < 2.0 / fft_size) | (np.abs(fy) < 2.0 / fft_size)
+    )
+    return window, mid_mask, high_mask, valid_mask, axis_mask
+
+
+def _spectral_metrics(channel: np.ndarray, fft_size: int) -> list[float]:
+    channel = cv2.resize(channel, (fft_size, fft_size), interpolation=cv2.INTER_AREA)
+    channel = channel.astype(np.float32)
+    residual = channel - cv2.GaussianBlur(channel, (0, 0), 2.0)
+    window, mid_mask, high_mask, valid_mask, axis_mask = _fft_geometry(fft_size)
+
+    spectrum = np.abs(
+                      np.fft.fftshift(
+                                     np.fft.fft2(  #<<2D FFT
+                                                residual * window[:, None] * window[None, :]
+                                                )
+                                    )
+                    )
+#한 프레임 당 _patches()로 5개의 패치를 뽑고, 각 패치에 대해 _spectral_metrics()를 호출한다.
+#각 patch마다 _single_patch_features()가 실행되고 그 안에서 3번의 FFT가 실행된다. (따라서 한 프레임 당 15번의 FFT가 실행된다. basic math^^)
+
+
+
+    spectrum = np.log1p(spectrum)
+#####
+
+
 
     def band(mask: np.ndarray) -> tuple[float, float, float]:
         values = spectrum[mask]
@@ -136,12 +165,14 @@ def _spectral_metrics(channel: np.ndarray, fft_size: int) -> list[float]:
 
     mid_mean, mid_peak, mid_entropy = band(mid_mask)
     high_mean, high_peak, high_entropy = band(high_mask)
-    axis_mask = valid_mask & ((np.abs(fx) < 2.0 / fft_size) | (np.abs(fy) < 2.0 / fft_size))
     axis_ratio = float(np.mean(spectrum[axis_mask]) / (np.mean(spectrum[valid_mask]) + EPS))
     return [mid_mean, mid_peak, mid_entropy, high_mean, high_peak, high_entropy, axis_ratio]
 
 
 def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
+    # 이 함수가 Stage 1의 핵심이다.
+    # RGB 원본을 그대로 학습하지 않고, 재촬영에서 변하기 쉬운 밝기·색차·
+    # 고주파 잔차·주기성(FFT)을 수치 특징으로 바꾼다.
     patch = patch_bgr.astype(np.float32) / 255.0
     b, g, r = cv2.split(patch)
     y = 0.114 * b + 0.587 * g + 0.299 * r
@@ -163,6 +194,8 @@ def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
 
     residuals = []
     for sigma in (0.7, 1.5, 3.0):
+        # Gaussian blur와의 차이는 화면 촬영 과정에서 생기는 미세한
+        # 모아레/샤프닝/압축 흔적을 표현한다.
         residual = y - cv2.GaussianBlur(y, (0, 0), sigma)
         residuals.append(residual)
         absolute = np.abs(residual)
@@ -193,8 +226,11 @@ def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
 
 
 def _frame_features(frame: np.ndarray, config: FeatureConfig) -> np.ndarray:
+    # 한 프레임에서 여러 패치의 특징을 구한 뒤 평균과 최대값을 함께 사용한다.
+    # 평균은 전역적인 흔적, 최대값은 국소적인 화면 흔적을 나타낸다.
+    patches = _patches(frame, config.patch_size)[: max(1, min(config.patches, 5))]
     patch_features = np.stack(
-        [_single_patch_features(patch, config.fft_size) for patch in _patches(frame, config.patch_size)]
+        [_single_patch_features(patch, config.fft_size) for patch in patches]
     )
     # Mean captures a global weak trace; maximum captures a localized screen trace.
     return np.concatenate([np.mean(patch_features, axis=0), np.max(patch_features, axis=0)]).astype(
@@ -209,6 +245,8 @@ def _small_gray(frame: np.ndarray, width: int) -> np.ndarray:
 
 
 def _temporal_features(frames: Sequence[np.ndarray], width: int) -> np.ndarray:
+    # 프레임 밝기 변화, 카메라 이동량, flicker를 계산하는 선택적 시간 특징.
+    # 현재 best.npz는 use_temporal=False로 학습되어 제출 경로에서는 사용하지 않는다.
     gray = [_small_gray(frame, width) for frame in frames]
     luminance = np.asarray([float(np.mean(item)) for item in gray], dtype=np.float32)
     differences = np.asarray(
@@ -249,6 +287,8 @@ def _temporal_features(frames: Sequence[np.ndarray], width: int) -> np.ndarray:
 
 
 def aggregate_sequence(sequence: np.ndarray, temporal: np.ndarray) -> np.ndarray:
+    # 프레임별 특징을 영상 단위 특징으로 압축한다.
+    # 평균/표준편차/10·90% 분위수로 프레임 수가 달라도 같은 길이의 벡터를 만든다.
     sequence = np.asarray(sequence, dtype=np.float32)
     aggregate = np.concatenate(
         [
@@ -265,6 +305,7 @@ def aggregate_sequence(sequence: np.ndarray, temporal: np.ndarray) -> np.ndarray
 def extract_from_frames(
     frames: Sequence[np.ndarray], config: FeatureConfig = FeatureConfig()
 ) -> tuple[np.ndarray, np.ndarray]:
+    # 이미 읽어온 프레임 중 config.frames개를 균일하게 선택해 특징을 만든다.
     if not frames:
         raise ValueError("at least one frame is required")
     positions = np.linspace(0, len(frames) - 1, config.frames).round().astype(int)
@@ -281,10 +322,13 @@ def extract_from_frames(
 def extract_video(
     path: str | Path, config: FeatureConfig = FeatureConfig()
 ) -> tuple[np.ndarray, np.ndarray]:
+    # 제출 추론에서 호출되는 영상 단위 진입점.
     return extract_from_frames(decode_uniform(path, config.frames), config)
 
 
 def iter_videos(root: str | Path) -> Iterable[Path]:
+    # 공식 구조(videos 바로 아래 파일)를 먼저 검색하고, 개발용 하위 폴더만
+    # 필요할 때 재귀 검색한다. 불필요한 대규모 디렉터리 순회를 피하기 위함이다.
     extensions = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".3gp", ".3gpp", ".wmv"}
     root = Path(root)
     if not root.is_dir():

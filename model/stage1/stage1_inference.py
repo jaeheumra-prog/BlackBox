@@ -19,6 +19,7 @@ def _sigmoid(value: np.ndarray) -> np.ndarray:
 
 class Stage1ForensicEnsemble:
     def __init__(self, checkpoint_path: str | Path):
+        # best.npz에는 신경망 가중치가 아니라 정규화 통계와 여러 선형 분류기의 계수/threshold가 저장되어 있다.
         checkpoint = np.load(checkpoint_path, allow_pickle=False)
         self.means = checkpoint["means"].astype(np.float32)
         self.scales = checkpoint["scales"].astype(np.float32)
@@ -35,6 +36,8 @@ class Stage1ForensicEnsemble:
         self.config = FeatureConfig(**config)
 
     def probability(self, aggregate: np.ndarray) -> tuple[float, float]:
+        # 영상 특징을 학습 때의 분포로 정규화한 뒤 여러 선형 모델의 확률을
+        # member_weights로 가중 평균한다.
         normalized = np.clip((aggregate[None, :] - self.means) / self.scales, -8.0, 8.0)
         logits = np.sum(normalized * self.coefficients, axis=1) + self.intercepts
         probabilities = _sigmoid(logits)
@@ -53,15 +56,20 @@ def predict_stage1(data_dir, model_dir):
     # submission runner may contain many more clips than the local demo set;
     # cap decode/feature work to keep the official 60-minute budget safe while
     # retaining the original spatial/FFT feature scales.
-    inference_config = replace(model.config, frames=min(model.config.frames, 4))
+    # 학습 설정(24프레임·5패치)을 그대로 쓰면 제출 시간이 길어진다.
+    # 따라서 공간/FFT 크기는 유지하고, 대표 프레임 2개와 중앙 패치 1개만
+    # 사용한다. 특징 벡터의 길이는 그대로라 checkpoint와 shape은 호환된다.
+    inference_config = replace(model.config, frames=min(model.config.frames, 2), patches=1)
     rows = []
     for path in iter_videos(root):
         try:
+            # 파일 하나를 읽고 forensic feature → 앙상블 확률 → 최종 라벨 순서로 처리한다.
             _, aggregate = extract_video(path, inference_config)
             probability, uncertainty = model.probability(aggregate)
             answer = "RERECORDED" if probability >= model.threshold else "ORIGINAL"
         except Exception:
             # A corrupt/unsupported video cannot establish direct-capture authenticity.
+            # 제출 중 전체 작업이 중단되지 않도록 보수적으로 RERECORDED를 반환한다.
             probability, uncertainty, answer = 1.0, 0.0, "RERECORDED"
         rows.append(
             {
