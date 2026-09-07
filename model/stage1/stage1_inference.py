@@ -53,7 +53,7 @@ def predict_stage1(data_dir, model_dir):
     # submission runner may contain many more clips than the local demo set;
     # cap decode/feature work to keep the official 60-minute budget safe while
     # retaining the original spatial/FFT feature scales.
-    inference_config = replace(model.config, frames=min(model.config.frames, 8))
+    inference_config = replace(model.config, frames=min(model.config.frames, 4))
     rows = []
     for path in iter_videos(root):
         try:

@@ -287,4 +287,12 @@ def extract_video(
 def iter_videos(root: str | Path) -> Iterable[Path]:
     extensions = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".3gp", ".3gpp", ".wmv"}
     root = Path(root)
+    if not root.is_dir():
+        return []
+    # The official layout places clips directly under ``videos``.  Avoid a
+    # recursive walk through unrelated files when that layout is present;
+    # retain the recursive fallback for development datasets with subfolders.
+    direct = sorted(path for path in root.iterdir() if path.is_file() and path.suffix.lower() in extensions)
+    if direct:
+        return direct
     return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in extensions)
