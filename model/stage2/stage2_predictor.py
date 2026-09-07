@@ -147,6 +147,19 @@ def estimate_collision_index(frames_bgr: list[np.ndarray]) -> tuple[int, np.ndar
     return index, score
 
 
+def _separated_peak_margin(
+    score: np.ndarray, peak_index: int, exclusion_radius: int = 3
+) -> float:
+    finite = score.copy()
+    left = max(0, peak_index - exclusion_radius)
+    right = min(len(finite), peak_index + exclusion_radius + 1)
+    finite[left:right] = -np.inf
+    alternatives = finite[np.isfinite(finite)]
+    if not len(alternatives):
+        return float("inf")
+    return float(score[peak_index] - np.max(alternatives))
+
+
 def _letterbox(image_rgb: np.ndarray, size: int) -> tuple[np.ndarray, tuple[float, int, int, int, int]]:
     height, width = image_rgb.shape[:2]
     ratio = min(size / height, size / width)
@@ -343,31 +356,61 @@ class YoloPBackend:
             self.model(warmup)
 
     def infer(
-        self, frame: np.ndarray, confidence_threshold: float = 0.18
+        self,
+        frame: np.ndarray,
+        confidence_threshold: float = 0.18,
+        input_size: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        height, width = frame.shape[:2]
-        array, geometry = _preprocess(frame, self.size)
-        tensor = torch.from_numpy(array).to(self.device)
+        return self.infer_batch(
+            [frame],
+            confidence_threshold=confidence_threshold,
+            input_size=input_size,
+        )[0]
+
+    def infer_batch(
+        self,
+        frames: list[np.ndarray],
+        confidence_threshold: float = 0.18,
+        input_size: int | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if not frames:
+            return []
+        size = self.size if input_size is None else int(input_size)
+        if size <= 0 or size % 32:
+            raise ValueError("YOLOP input size must be a positive multiple of 32")
+        prepared = [_preprocess(frame, size) for frame in frames]
+        tensor = torch.from_numpy(
+            np.concatenate([item[0] for item in prepared], axis=0)
+        ).to(self.device)
         if self.use_half:
             tensor = tensor.half()
         with torch.inference_mode():
             detection_bundle, drivable_tensor, lane_tensor = self.model(tensor)
-        detections = self.non_max_suppression(
+        detections_per_frame = self.non_max_suppression(
             detection_bundle[0].float(),
             conf_thres=confidence_threshold,
             iou_thres=0.45,
-        )[0]
-        if detections is None or len(detections) == 0:
-            boxes = np.empty((0, 6), dtype=np.float64)
-        else:
-            boxes = detections.cpu().numpy().astype(np.float64)
-            boxes = _restore_boxes(boxes, geometry, width, height)
-            widths = boxes[:, 2] - boxes[:, 0]
-            heights = boxes[:, 3] - boxes[:, 1]
-            boxes = boxes[(widths >= 6) & (heights >= 6)]
-        drivable = _restore_mask(drivable_tensor.float().cpu().numpy(), geometry, width, height)
-        lane = _restore_mask(lane_tensor.float().cpu().numpy(), geometry, width, height)
-        return boxes, drivable, lane
+        )
+        drivable_output = drivable_tensor.float().cpu().numpy()
+        lane_output = lane_tensor.float().cpu().numpy()
+        results: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for index, (frame, (_, geometry)) in enumerate(zip(frames, prepared)):
+            height, width = frame.shape[:2]
+            detections = detections_per_frame[index]
+            if detections is None or len(detections) == 0:
+                boxes = np.empty((0, 6), dtype=np.float64)
+            else:
+                boxes = detections.cpu().numpy().astype(np.float64)
+                boxes = _restore_boxes(boxes, geometry, width, height)
+                widths = boxes[:, 2] - boxes[:, 0]
+                heights = boxes[:, 3] - boxes[:, 1]
+                boxes = boxes[(widths >= 6) & (heights >= 6)]
+            drivable = _restore_mask(
+                drivable_output[index : index + 1], geometry, width, height
+            )
+            lane = _restore_mask(lane_output[index : index + 1], geometry, width, height)
+            results.append((boxes, drivable, lane))
+        return results
 
 
 def _fallback_boundaries(y: float, width: int, height: int) -> tuple[float, float]:
@@ -505,6 +548,9 @@ def infer_entry(
     return entry_index, side, {
         "reason": reason,
         "track_id": victim.identifier,
+        "initial_center_x": initial_center,
+        "final_center_x": final_center,
+        "lateral_motion_px": lateral_motion,
         "signed_distances": signed,
         "record_indices": [record.frame_index for record in records],
     }
@@ -557,10 +603,27 @@ def infer_evasion(
 
 
 class Stage2Predictor:
-    def __init__(self, model_dir: Path, model_size: int = 640):
+    def __init__(
+        self,
+        model_dir: Path,
+        model_size: int = 640,
+        batch_size: int | None = None,
+    ):
         self.model_dir = Path(model_dir)
         self.model_size = model_size
         self.backend = YoloPBackend(self.model_dir, model_size)
+        if batch_size is None:
+            batch_size = 1
+            if self.backend.device.type == "cuda":
+                total_memory = torch.cuda.get_device_properties(
+                    self.backend.device
+                ).total_memory
+                # Keep the validated batch-1 path on consumer GPUs. The official
+                # L40S has ample memory, where a small batch improves throughput
+                # without discarding any temporal samples.
+                if total_memory >= 20 * 1024**3:
+                    batch_size = 4
+        self.batch_size = max(1, int(batch_size))
 
         try:
             from ego_lane_geometry import EgoLaneBoundaryTracker
@@ -583,23 +646,44 @@ class Stage2Predictor:
             raise ValueError(f"No readable images in {folder}")
         height, width = first_frame.shape[:2]
 
+        maximum_index = min(len(paths) - 1, collision_index + 3)
         tracker = GreedyTracker(maximum_gap=5)
-        boundary_tracker = self.boundary_tracker_type(smoothing=0.70, maximum_missing_frames=4)
+        boundary_tracker = self.boundary_tracker_type(
+            smoothing=0.70, maximum_missing_frames=4
+        )
         collision_mask: np.ndarray | None = None
         last_mask: np.ndarray | None = None
-        maximum_index = min(len(paths) - 1, collision_index + 3)
-        for index, path in enumerate(paths[: maximum_index + 1]):
-            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if frame is None:
-                continue
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-            boxes, drivable, lane = self.backend.infer(frame)
-            boundaries = boundary_tracker.update(lane)
-            tracker.update(index, boxes, boundaries)
-            last_mask = drivable
-            if index == collision_index:
-                collision_mask = drivable
+        impact_masks: dict[int, np.ndarray] = {}
+        boundary_frames = 0
+        processed_frames = 0
+        effective_batch_size = self.batch_size if self.backend.device.type == "cuda" else 1
+        for start in range(0, maximum_index + 1, effective_batch_size):
+            batch_indices = list(
+                range(start, min(maximum_index + 1, start + effective_batch_size))
+            )
+            batch_frames: list[np.ndarray] = []
+            valid_indices: list[int] = []
+            for index in batch_indices:
+                frame = cv2.imread(str(paths[index]), cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(
+                        frame, (width, height), interpolation=cv2.INTER_AREA
+                    )
+                batch_frames.append(frame)
+                valid_indices.append(index)
+            batch_results = self.backend.infer_batch(batch_frames)
+            for index, (boxes, drivable, lane) in zip(valid_indices, batch_results):
+                boundaries = boundary_tracker.update(lane)
+                boundary_frames += int(boundaries is not None)
+                tracker.update(index, boxes, boundaries)
+                last_mask = drivable
+                processed_frames += 1
+                if abs(index - collision_index) <= 1:
+                    impact_masks[index] = drivable
+                if index == collision_index:
+                    collision_mask = drivable
         if collision_mask is None:
             collision_mask = last_mask
 
@@ -610,6 +694,62 @@ class Stage2Predictor:
         evasion_space, evasion_debug = infer_evasion(
             victim, collision_index, collision_mask, width, height
         )
+        temporal_entry_views: list[dict[str, object]] = []
+        if victim is not None:
+            for parity in (0, 1):
+                view_records = [
+                    record
+                    for record in victim.records
+                    if record.frame_index % 2 == parity
+                ]
+                if len(view_records) < 2:
+                    continue
+                view_track = Track(victim.identifier, records=view_records)
+                view_entry, view_side, view_debug = infer_entry(
+                    view_track, collision_index, len(paths), width, height
+                )
+                temporal_entry_views.append(
+                    {
+                        "parity": parity,
+                        "entry_index": view_entry,
+                        "entry_side": view_side,
+                        "reason": view_debug.get("reason"),
+                    }
+                )
+        side_view_consistent = bool(
+            len(temporal_entry_views) == 2
+            and all(view["entry_side"] == entry_side for view in temporal_entry_views)
+        )
+        entry_view_consistent = bool(
+            len(temporal_entry_views) == 2
+            and max(int(view["entry_index"]) for view in temporal_entry_views)
+            - min(int(view["entry_index"]) for view in temporal_entry_views)
+            <= 2
+        )
+
+        temporal_evasion_views: list[dict[str, object]] = []
+        for view_index, view_mask in sorted(impact_masks.items()):
+            view_label, view_debug = infer_evasion(
+                victim, view_index, view_mask, width, height
+            )
+            view_margin = float(
+                max(
+                    float(view_debug.get("left_gap", 0.0)),
+                    float(view_debug.get("right_gap", 0.0)),
+                )
+                - float(view_debug.get("required_gap", 0.0))
+            )
+            temporal_evasion_views.append(
+                {"frame_index": view_index, "label": view_label, "margin_px": view_margin}
+            )
+        evasion_view_consistent = bool(
+            len(temporal_evasion_views) >= 2
+            and all(view["label"] == evasion_space for view in temporal_evasion_views)
+        )
+        minimum_evasion_margin = min(
+            (abs(float(view["margin_px"])) for view in temporal_evasion_views),
+            default=0.0,
+        )
         collision_index = int(np.clip(collision_index, 0, len(paths) - 1))
         entry_index = int(np.clip(entry_index, 0, collision_index))
         row = {
@@ -619,6 +759,23 @@ class Stage2Predictor:
             "evasion_space": int(evasion_space),
             "entry_side": entry_side,
         }
+        lane_fraction = boundary_frames / max(1, processed_frames)
+        victim_margin = (
+            float(ranking[0][1] - ranking[1][1]) if len(ranking) >= 2 else None
+        )
+        victim_records = len(victim.records) if victim is not None else 0
+        lateral_fraction = abs(float(entry_debug.get("lateral_motion_px", 0.0))) / max(
+            1.0, width
+        )
+        evasion_margin = float(
+            max(
+                float(evasion_debug.get("left_gap", 0.0)),
+                float(evasion_debug.get("right_gap", 0.0)),
+            )
+            - float(evasion_debug.get("required_gap", 0.0))
+        )
+        collision_margin = _separated_peak_margin(impact_score, impact_peak)
+        reliable_victim = victim_margin is None or victim_margin >= 0.05
         debug = {
             "frame_count": len(paths),
             "collision_index": collision_index,
@@ -626,6 +783,53 @@ class Stage2Predictor:
             "victim_ranking": ranking[:10],
             "entry": entry_debug,
             "evasion": evasion_debug,
+            "runtime": {
+                "model_input_size": self.model_size,
+                "batch_size": effective_batch_size,
+                "processed_frames": processed_frames,
+                "lane_boundary_fraction": lane_fraction,
+            },
+            "uncertainty": {
+                "collision_peak_margin": collision_margin,
+                "victim_margin": victim_margin,
+                "victim_track_records": victim_records,
+                "side_motion_fraction": lateral_fraction,
+                "evasion_margin_px": evasion_margin,
+                "entry_evidence": entry_debug.get("reason"),
+                "entry_views": temporal_entry_views,
+                "evasion_views": temporal_evasion_views,
+                "side_view_consistent": side_view_consistent,
+                "entry_view_consistent": entry_view_consistent,
+                "evasion_view_consistent": evasion_view_consistent,
+            },
+            # These deliberately strict gates are for offline pseudo-label export,
+            # not for changing the submitted prediction. Low-confidence examples
+            # remain unlabeled instead of reinforcing the current rule's mistakes.
+            "teacher_gate": {
+                # Collision pseudo-labeling remains disabled: the public hard
+                # labels are too few to calibrate a safe confidence threshold.
+                "collision": False,
+                "entry": bool(
+                    reliable_victim
+                    and victim_records >= 6
+                    and lane_fraction >= 0.50
+                    and entry_view_consistent
+                    and entry_debug.get("reason") == "observed_wheel_contact"
+                ),
+                "side": bool(
+                    reliable_victim
+                    and victim_records >= 6
+                    and lateral_fraction >= 0.05
+                    and side_view_consistent
+                ),
+                "evasion": bool(
+                    reliable_victim
+                    and victim_records >= 4
+                    and collision_mask is not None
+                    and evasion_view_consistent
+                    and minimum_evasion_margin >= 0.05 * width
+                ),
+            },
         }
         return row, debug
 

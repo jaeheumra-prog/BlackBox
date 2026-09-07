@@ -14,32 +14,16 @@ from pathlib import Path
 
 import cv2
 import math
-try:
-    import matplotlib
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError:  # plotting is not used by inference
-    matplotlib = None
-    plt = None
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-try:
-    import yaml
-except ModuleNotFoundError:
-    yaml = None
-try:
-    from PIL import Image
-except ModuleNotFoundError:
-    Image = None
-try:
-    from scipy.cluster.vq import kmeans
-    from scipy.signal import butter, filtfilt
-except ModuleNotFoundError:
-    kmeans = butter = filtfilt = None
-try:
-    from tqdm import tqdm
-except ModuleNotFoundError:
-    tqdm = lambda iterable, *args, **kwargs: iterable
+import yaml
+from PIL import Image
+from scipy.cluster.vq import kmeans
+from scipy.signal import butter, filtfilt
+from tqdm import tqdm
 
 
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-9):

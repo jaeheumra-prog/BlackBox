@@ -1,31 +1,5 @@
 import os
-try:
-    from yacs.config import CfgNode as CN
-except ModuleNotFoundError:  # keep inference self-contained in the runner
-    class CN(dict):
-        """Minimal attribute-style config used by YOLOP during inference."""
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args)
-            object.__setattr__(self, "_frozen", False)
-
-        def __getattr__(self, name):
-            try:
-                return self[name]
-            except KeyError as exc:
-                raise AttributeError(name) from exc
-
-        def __setattr__(self, name, value):
-            if name.startswith("_"):
-                object.__setattr__(self, name, value)
-            else:
-                self[name] = value
-
-        def freeze(self):
-            object.__setattr__(self, "_frozen", True)
-
-        def defrost(self):
-            object.__setattr__(self, "_frozen", False)
+from yacs.config import CfgNode as CN
 
 
 _C = CN()

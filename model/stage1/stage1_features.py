@@ -21,7 +21,7 @@ EPS = 1e-6
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    # 한 영상에서 뽑을 대표 프레임 수. 제출 추론에서는 시간 제한 때문에 2로 줄인다.
+    # 한 영상 view에서 뽑을 대표 프레임 수.
     frames: int = 24
     # 화면 전체가 아니라 여러 위치의 패치를 잘라 재촬영 흔적을 비교한다.
     patch_size: int = 192
@@ -31,7 +31,7 @@ class FeatureConfig:
     temporal_width: int = 320
     # 현재 선택된 체크포인트에서는 False이다. 기능 자체는 남아 있다.
     use_temporal: bool = True
-    # 학습 기본값은 5개 패치이며, 제출 추론에서는 중앙 패치 1개만 사용한다.
+    # 한 프레임에서 사용할 패치 수. Fast 모델은 3, Teacher는 5를 사용한다.
     patches: int = 5
 
 
@@ -67,12 +67,19 @@ def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
             if ok:
                 frames.append(frame)
     elif total > 300:
+        # Long-GOP MP4 files can be much slower when seeking once per sample.
+        # Decode them once and retain only the requested frames.
         wanted = np.linspace(0, total - 1, count).round().astype(int)
-        for index in wanted:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+        wanted_set = set(int(index) for index in wanted)
+        index = 0
+        while index < total and wanted_set:
             ok, frame = capture.read()
-            if ok:
+            if not ok:
+                break
+            if index in wanted_set:
                 frames.append(frame)
+                wanted_set.remove(index)
+            index += 1
     else:
         # Unknown-length streams: bounded sequential decoding.
         while len(frames) < count:
@@ -88,6 +95,101 @@ def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
         positions = np.linspace(0, len(frames) - 1, count).round().astype(int)
         frames = [frames[int(i)] for i in positions]
     return frames[:count]
+
+
+def decode_stratified_views(
+    path: str | Path,
+    count: int = 8,
+    views: int = 2,
+) -> list[list[np.ndarray]]:
+    """Decode interleaved temporal views with one pass over the video.
+
+    Each view contains one frame from every temporal segment.  View 0 and view
+    1 use different offsets inside the same segments, so both have the exact
+    ``count``-frame distribution used to train the Fast model.
+    """
+
+    if count < 1 or views < 1:
+        raise ValueError("count and views must be positive")
+
+    path = Path(path)
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"cannot open video: {path}")
+
+    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        decoded: list[np.ndarray] = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            decoded.append(frame)
+        capture.release()
+        if not decoded:
+            raise ValueError(f"cannot decode frames: {path}")
+        total = len(decoded)
+        positions = _stratified_positions(total, count, views)
+        return [[decoded[int(index)] for index in row] for row in positions]
+
+    positions = _stratified_positions(total, count, views)
+    unique = sorted(set(int(index) for index in positions.ravel()))
+    decoded_by_index: dict[int, np.ndarray] = {}
+
+    if total <= 300:
+        for index in unique:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = capture.read()
+            if ok:
+                decoded_by_index[index] = frame
+    else:
+        wanted = set(unique)
+        index = 0
+        while index < total and wanted:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if index in wanted:
+                decoded_by_index[index] = frame
+                wanted.remove(index)
+            index += 1
+    capture.release()
+
+    if not decoded_by_index:
+        raise ValueError(f"cannot decode frames: {path}")
+
+    available = np.asarray(sorted(decoded_by_index), dtype=np.int64)
+    output: list[list[np.ndarray]] = []
+    for row in positions:
+        frames = []
+        for requested in row:
+            requested = int(requested)
+            if requested not in decoded_by_index:
+                nearest = int(available[np.argmin(np.abs(available - requested))])
+                requested = nearest
+            frames.append(decoded_by_index[requested])
+        output.append(frames)
+    return output
+
+
+def _stratified_positions(total: int, count: int, views: int) -> np.ndarray:
+    """Return deterministic, segment-aligned positions for temporal views."""
+
+    offsets = (np.arange(views, dtype=np.float64) + 1.0) / (views + 1.0)
+    segments = np.arange(count, dtype=np.float64)
+    positions = ((segments[None, :] + offsets[:, None]) * total / count).astype(np.int64)
+    return np.clip(positions, 0, max(0, total - 1))
+
+
+def stratified_views_from_frames(
+    frames: Sequence[np.ndarray], count: int = 8, views: int = 2
+) -> list[list[np.ndarray]]:
+    """Create the same temporal views from an already decoded frame pool."""
+
+    if not frames:
+        raise ValueError("empty frame pool")
+    positions = _stratified_positions(len(frames), count, views)
+    return [[frames[int(index)] for index in row] for row in positions]
 
 
 def _patches(image: np.ndarray, patch_size: int) -> list[np.ndarray]:
@@ -228,7 +330,13 @@ def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
 def _frame_features(frame: np.ndarray, config: FeatureConfig) -> np.ndarray:
     # 한 프레임에서 여러 패치의 특징을 구한 뒤 평균과 최대값을 함께 사용한다.
     # 평균은 전역적인 흔적, 최대값은 국소적인 화면 흔적을 나타낸다.
-    patches = _patches(frame, config.patch_size)[: max(1, min(config.patches, 5))]
+    available = _patches(frame, config.patch_size)
+    count = max(1, min(config.patches, 5))
+    # Three patches should cover the image rather than taking the first three
+    # entries (centre + both top corners).  Teacher-5 and centre-only behavior
+    # remain backward compatible.
+    indices = {1: [0], 2: [1, 4], 3: [0, 1, 4], 4: [0, 1, 2, 4], 5: [0, 1, 2, 3, 4]}[count]
+    patches = [available[index] for index in indices]
     patch_features = np.stack(
         [_single_patch_features(patch, config.fft_size) for patch in patches]
     )
@@ -324,6 +432,17 @@ def extract_video(
 ) -> tuple[np.ndarray, np.ndarray]:
     # 제출 추론에서 호출되는 영상 단위 진입점.
     return extract_from_frames(decode_uniform(path, config.frames), config)
+
+
+def extract_video_views(
+    path: str | Path,
+    config: FeatureConfig,
+    views: int = 2,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Extract several exact-match Fast views after decoding the video once."""
+
+    decoded = decode_stratified_views(path, config.frames, views)
+    return [extract_from_frames(frames, config) for frames in decoded]
 
 
 def iter_videos(root: str | Path) -> Iterable[Path]:

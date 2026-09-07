@@ -6,10 +6,7 @@ from lib.utils import plot_img_and_mask,plot_one_box,show_seg_result
 import torch
 from threading import Thread
 import numpy as np
-try:
-    from PIL import Image
-except ModuleNotFoundError:
-    Image = None
+from PIL import Image
 from torchvision import transforms
 from pathlib import Path
 import json
@@ -18,10 +15,7 @@ import cv2
 import os
 import math
 from torch.cuda import amp
-try:
-    from tqdm import tqdm
-except ModuleNotFoundError:
-    tqdm = lambda iterable, *args, **kwargs: iterable
+from tqdm import tqdm
 
 
 def train(cfg, train_loader, model, criterion, optimizer, scaler, epoch, num_batch, num_warmup,

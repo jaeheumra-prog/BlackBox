@@ -9,7 +9,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from stage1_features import FeatureConfig, extract_video, iter_videos
+from stage1_features import (
+    FeatureConfig,
+    decode_stratified_views,
+    extract_from_frames,
+    extract_video,
+    iter_videos,
+)
 
 
 def _sigmoid(value: np.ndarray) -> np.ndarray:
@@ -32,12 +38,19 @@ class Stage1ForensicEnsemble:
         )
         self.member_weights /= np.sum(self.member_weights)
         self.threshold = float(checkpoint["threshold"][0])
+        self.uncertainty_band = (
+            checkpoint["uncertainty_band"].astype(np.float32)
+            if "uncertainty_band" in checkpoint.files
+            else None
+        )
         config = json.loads(str(checkpoint["config"][0]))
         self.config = FeatureConfig(**config)
 
     def probability(self, aggregate: np.ndarray) -> tuple[float, float]:
         # 영상 특징을 학습 때의 분포로 정규화한 뒤 여러 선형 모델의 확률을
         # member_weights로 가중 평균한다.
+        dimension = self.coefficients.shape[1]
+        aggregate = np.asarray(aggregate, dtype=np.float32)[:dimension]
         normalized = np.clip((aggregate[None, :] - self.means) / self.scales, -8.0, 8.0)
         logits = np.sum(normalized * self.coefficients, axis=1) + self.intercepts
         probabilities = _sigmoid(logits)
@@ -46,26 +59,54 @@ class Stage1ForensicEnsemble:
         return mean, float(np.sqrt(max(variance, 0.0)))
 
 
+def _logit_average(first: float, second: float) -> float:
+    values = np.clip(np.asarray([first, second], dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    logits = np.log(values / (1.0 - values))
+    return float(_sigmoid(np.asarray([np.mean(logits)]))[0])
+
+
+def _fast_probability(path: Path, model: Stage1ForensicEnsemble):
+    # Decode both interleaved views in one pass.  Feature extraction for the
+    # second view is only paid when the first prediction is near the threshold.
+    views = decode_stratified_views(path, model.config.frames, views=2)
+    _, aggregate = extract_from_frames(views[0], model.config)
+    first, first_uncertainty = model.probability(aggregate)
+    if model.uncertainty_band is None:
+        return first, first_uncertainty
+    lower, upper = (float(value) for value in model.uncertainty_band)
+    if not lower <= first <= upper:
+        return first, first_uncertainty
+    _, second_aggregate = extract_from_frames(views[1], model.config)
+    second, second_uncertainty = model.probability(second_aggregate)
+    return _logit_average(first, second), max(first_uncertainty, second_uncertainty, abs(first - second) / 2.0)
+
+
 def predict_stage1(data_dir, model_dir):
     """Return columns [ID, answer] for every video under data_dir/videos."""
 
     root = Path(data_dir) / "videos"
-    model = Stage1ForensicEnsemble(Path(model_dir) / "best.npz")
-    # The forensic classifier was trained with 24 uniformly sampled frames,
-    # but its aggregate statistics are stable with a smaller sample.  The
-    # submission runner may contain many more clips than the local demo set;
-    # cap decode/feature work to keep the official 60-minute budget safe while
-    # retaining the original spatial/FFT feature scales.
-    # 학습 설정(24프레임·5패치)을 그대로 쓰면 제출 시간이 길어진다.
-    # 따라서 공간/FFT 크기는 유지하고, 대표 프레임 2개와 중앙 패치 1개만
-    # 사용한다. 특징 벡터의 길이는 그대로라 checkpoint와 shape은 호환된다.
-    inference_config = replace(model.config, frames=min(model.config.frames, 2), patches=1)
+    model_root = Path(model_dir)
+    fast_checkpoint = model_root / "best_fast_8x3.npz"
+    checkpoint = fast_checkpoint if fast_checkpoint.is_file() else model_root / "best.npz"
+    model = Stage1ForensicEnsemble(checkpoint)
+    is_fast = model.uncertainty_band is not None
+    # The fast checkpoint was trained with exactly the same 8-frame x 3-patch
+    # configuration used here.  The legacy fallback retains its old time-safe
+    # 2-frame x 1-patch behavior for backwards compatibility.
+    inference_config = (
+        model.config
+        if is_fast
+        else replace(model.config, frames=min(model.config.frames, 2), patches=1)
+    )
     rows = []
     for path in iter_videos(root):
         try:
             # 파일 하나를 읽고 forensic feature → 앙상블 확률 → 최종 라벨 순서로 처리한다.
-            _, aggregate = extract_video(path, inference_config)
-            probability, uncertainty = model.probability(aggregate)
+            if is_fast:
+                probability, uncertainty = _fast_probability(path, model)
+            else:
+                _, aggregate = extract_video(path, inference_config)
+                probability, uncertainty = model.probability(aggregate)
             answer = "RERECORDED" if probability >= model.threshold else "ORIGINAL"
         except Exception:
             # A corrupt/unsupported video cannot establish direct-capture authenticity.
@@ -85,11 +126,20 @@ def predict_stage1(data_dir, model_dir):
 
 def predict_stage1_with_diagnostics(data_dir, model_dir):
     root = Path(data_dir) / "videos"
-    model = Stage1ForensicEnsemble(Path(model_dir) / "best.npz")
+    model_root = Path(model_dir)
+    checkpoint = (
+        model_root / "best_fast_8x3.npz"
+        if (model_root / "best_fast_8x3.npz").is_file()
+        else model_root / "best.npz"
+    )
+    model = Stage1ForensicEnsemble(checkpoint)
     rows = []
     for path in iter_videos(root):
-        _, aggregate = extract_video(path, model.config)
-        probability, uncertainty = model.probability(aggregate)
+        if model.uncertainty_band is not None:
+            probability, uncertainty = _fast_probability(path, model)
+        else:
+            _, aggregate = extract_video(path, model.config)
+            probability, uncertainty = model.probability(aggregate)
         rows.append(
             {
                 "ID": path.stem,

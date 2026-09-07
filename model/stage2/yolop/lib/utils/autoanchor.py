@@ -2,18 +2,9 @@
 
 import numpy as np
 import torch
-try:
-    import yaml
-except ModuleNotFoundError:
-    yaml = None
-try:
-    from scipy.cluster.vq import kmeans
-except ModuleNotFoundError:
-    kmeans = None
-try:
-    from tqdm import tqdm
-except ModuleNotFoundError:
-    tqdm = lambda iterable, *args, **kwargs: iterable
+import yaml
+from scipy.cluster.vq import kmeans
+from tqdm import tqdm
 from lib.utils import is_parallel
 
 

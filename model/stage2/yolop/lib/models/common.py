@@ -2,10 +2,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-try:
-    from PIL import Image, ImageDraw
-except ModuleNotFoundError:  # image helpers are unused by the forward pass
-    Image = ImageDraw = None
+from PIL import Image, ImageDraw
 import torch.nn.functional as F
 
 

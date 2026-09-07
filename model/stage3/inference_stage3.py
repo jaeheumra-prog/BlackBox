@@ -145,9 +145,11 @@ def predict_stage3(data_dir, model_dir):
     device = torch.device(
         "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
     )
-    model_path = Path(model_dir) / "best.pt"
-    if not model_path.is_file():  # local-development checkpoint name
-        model_path = Path(model_dir) / "best_finetune.pt"
+    candidates = ("best.pt", "best_submission.pt", "best_finetune.pt")
+    model_path = next(
+        (Path(model_dir) / name for name in candidates if (Path(model_dir) / name).is_file()),
+        Path(model_dir) / candidates[0],
+    )
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
     if tuple(checkpoint["motion_names"]) != MOTION_FEATURES:
         raise ValueError("Stage 3 checkpoint feature order does not match inference code")
@@ -160,11 +162,14 @@ def predict_stage3(data_dir, model_dir):
         raise ValueError("Stage 3 checkpoint normalization shape is invalid")
     std = np.maximum(np.abs(std), 1e-6)
     context = int(checkpoint["window_samples"])
+    motion_width = int(checkpoint.get("motion_extraction_width", 320))
+    if motion_width < 128:
+        raise ValueError("Stage 3 motion extraction width is implausibly small")
     rows = []
 
     with torch.inference_mode():
         for video_path in _video_paths(Path(data_dir) / "videos"):
-            motion = (_extract_motion(video_path) - mean) / std
+            motion = (_extract_motion(video_path, width=motion_width) - mean) / std
             frame_count = len(motion)
             offsets = np.arange(context - 1, -1, -1)
             accel_parts, steer_parts = [], []
