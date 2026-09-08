@@ -76,10 +76,6 @@ def _fast_probability(path: Path, model: Stage1ForensicEnsemble):
     if model.uncertainty_band is None:
         return first, first_uncertainty
     lower, upper = (float(value) for value in model.uncertainty_band)
-    # The CUDA FFT uses equivalent, batched image operators rather than the
-    # exact OpenCV kernels.  Recheck the broad decision boundary with the
-    # reference CPU descriptor so approximation error cannot flip a difficult
-    # sample.  Confident samples keep the fast GPU result.
     if not lower <= first <= upper:
         return first, first_uncertainty
     _, second_aggregate = extract_from_frames(views[1], model.config)
@@ -117,14 +113,6 @@ def predict_stage1(data_dir, model_dir):
     checkpoint = fast_checkpoint if fast_checkpoint.is_file() else model_root / "best.npz"
     model = Stage1ForensicEnsemble(checkpoint)
     is_fast = model.uncertainty_band is not None
-    # The fast checkpoint was trained with exactly the same 8-frame x 3-patch
-    # configuration used here.  The legacy fallback retains its old time-safe
-    # 2-frame x 1-patch behavior for backwards compatibility.
-    inference_config = (
-        model.config
-        if is_fast
-        else replace(model.config, frames=min(model.config.frames, 2), patches=1)
-    )
     paths = list(iter_videos(root))
     # Stage 1 files are independent.  A small thread pool lets OpenCV/NumPy
     # overlap decode and feature extraction on the evaluator's 7 vCPUs while

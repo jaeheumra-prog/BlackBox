@@ -17,6 +17,35 @@ import numpy as np
 
 
 EPS = 1e-6
+# A malformed or unusually long file must not force the evaluator to decode an
+# unbounded number of frames.  Normal competition clips are much shorter; for
+# longer clips we switch to sparse frame seeks below, preserving temporal
+# coverage without scanning the whole stream.
+MAX_SEQUENTIAL_DECODE_FRAMES = 2400
+# FFmpeg-backed OpenCV supports read/open timeouts for problematic containers.
+# The fallback constructor keeps compatibility with builds that do not accept
+# the optional parameter list.
+VIDEO_OPEN_TIMEOUT_MSEC = 5000
+VIDEO_READ_TIMEOUT_MSEC = 5000
+
+
+def _open_capture(path: Path) -> cv2.VideoCapture:
+    """Open a video without allowing a pathological container to wait forever."""
+
+    params = [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+        VIDEO_OPEN_TIMEOUT_MSEC,
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+        VIDEO_READ_TIMEOUT_MSEC,
+    ]
+    try:
+        capture = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, params)
+    except (TypeError, cv2.error):
+        capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError(f"cannot open video: {path}")
+    return capture
 
 
 @dataclass(frozen=True)
@@ -51,9 +80,7 @@ def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
     """영상 전체를 메모리에 올리지 않고 대표 BGR 프레임만 읽는다."""
 
     path = Path(path)
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise ValueError(f"cannot open video: {path}")
+    capture = _open_capture(path)
 
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     frames: list[np.ndarray] = []
@@ -113,14 +140,15 @@ def decode_stratified_views(
         raise ValueError("count and views must be positive")
 
     path = Path(path)
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise ValueError(f"cannot open video: {path}")
+    capture = _open_capture(path)
 
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:
         decoded: list[np.ndarray] = []
-        while True:
+        # Some containers report an unknown frame count.  Bound this fallback
+        # so a corrupt stream cannot hang Stage 1 indefinitely or grow memory
+        # without limit.
+        while len(decoded) < MAX_SEQUENTIAL_DECODE_FRAMES:
             ok, frame = capture.read()
             if not ok:
                 break
@@ -136,20 +164,29 @@ def decode_stratified_views(
     unique = sorted(set(int(index) for index in positions.ravel()))
     decoded_by_index: dict[int, np.ndarray] = {}
 
-    # Repeated MP4 seeks can be much slower than one sequential decode because
-    # each seek may restart from a keyframe.  Decode the stream once for every
-    # known frame count and retain only the requested indices; this is faster
-    # for both short clips and the long 10-Hz driving videos used in Stage 3.
-    wanted = set(unique)
-    index = 0
-    while index < total and wanted:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        if index in wanted:
-            decoded_by_index[index] = frame
-            wanted.remove(index)
-        index += 1
+    if total <= MAX_SEQUENTIAL_DECODE_FRAMES:
+        # Repeated MP4 seeks can be much slower than one sequential decode
+        # because each seek may restart from a keyframe.  For ordinary clips,
+        # decode once and retain only the requested indices.
+        wanted = set(unique)
+        index = 0
+        while index < total and wanted:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if index in wanted:
+                decoded_by_index[index] = frame
+                wanted.remove(index)
+            index += 1
+    else:
+        # For very long clips, scanning to the final requested frame for every
+        # video is the dominant cost.  Sparse seeks keep the same temporal
+        # positions while bounding work to the small number of requested views.
+        for requested in unique:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(requested))
+            ok, frame = capture.read()
+            if ok:
+                decoded_by_index[int(requested)] = frame
     capture.release()
 
     if not decoded_by_index:
