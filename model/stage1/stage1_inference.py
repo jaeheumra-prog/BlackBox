@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 
 import numpy as np
@@ -74,11 +76,36 @@ def _fast_probability(path: Path, model: Stage1ForensicEnsemble):
     if model.uncertainty_band is None:
         return first, first_uncertainty
     lower, upper = (float(value) for value in model.uncertainty_band)
+    # The CUDA FFT uses equivalent, batched image operators rather than the
+    # exact OpenCV kernels.  Recheck the broad decision boundary with the
+    # reference CPU descriptor so approximation error cannot flip a difficult
+    # sample.  Confident samples keep the fast GPU result.
     if not lower <= first <= upper:
         return first, first_uncertainty
     _, second_aggregate = extract_from_frames(views[1], model.config)
     second, second_uncertainty = model.probability(second_aggregate)
     return _logit_average(first, second), max(first_uncertainty, second_uncertainty, abs(first - second) / 2.0)
+
+
+def _predict_one(path: Path, model: Stage1ForensicEnsemble, is_fast: bool):
+    try:
+        if is_fast:
+            probability, uncertainty = _fast_probability(path, model)
+        else:
+            _, aggregate = extract_video(path, replace(model.config, frames=min(model.config.frames, 2), patches=1))
+            probability, uncertainty = model.probability(aggregate)
+        answer = "RERECORDED" if probability >= model.threshold else "ORIGINAL"
+    except Exception:
+        # A corrupt/unsupported video cannot establish direct-capture
+        # authenticity.  Keep the submission alive and choose the conservative
+        # fallback used by the original sequential implementation.
+        probability, uncertainty, answer = 1.0, 0.0, "RERECORDED"
+    return {
+        "ID": path.stem,
+        "answer": answer,
+        "_probability": probability,
+        "_uncertainty": uncertainty,
+    }
 
 
 def predict_stage1(data_dir, model_dir):
@@ -98,28 +125,21 @@ def predict_stage1(data_dir, model_dir):
         if is_fast
         else replace(model.config, frames=min(model.config.frames, 2), patches=1)
     )
-    rows = []
-    for path in iter_videos(root):
+    paths = list(iter_videos(root))
+    # Stage 1 files are independent.  A small thread pool lets OpenCV/NumPy
+    # overlap decode and feature extraction on the evaluator's 7 vCPUs while
+    # keeping one model copy and deterministic input order.
+    workers = min(4, max(1, os.cpu_count() or 1), len(paths) or 1)
+    if workers > 1:
         try:
-            # 파일 하나를 읽고 forensic feature → 앙상블 확률 → 최종 라벨 순서로 처리한다.
-            if is_fast:
-                probability, uncertainty = _fast_probability(path, model)
-            else:
-                _, aggregate = extract_video(path, inference_config)
-                probability, uncertainty = model.probability(aggregate)
-            answer = "RERECORDED" if probability >= model.threshold else "ORIGINAL"
+            import cv2
+            cv2.setNumThreads(1)
         except Exception:
-            # A corrupt/unsupported video cannot establish direct-capture authenticity.
-            # 제출 중 전체 작업이 중단되지 않도록 보수적으로 RERECORDED를 반환한다.
-            probability, uncertainty, answer = 1.0, 0.0, "RERECORDED"
-        rows.append(
-            {
-                "ID": path.stem,
-                "answer": answer,
-                "_probability": probability,
-                "_uncertainty": uncertainty,
-            }
-        )
+            pass
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            rows = list(executor.map(lambda path: _predict_one(path, model, is_fast), paths))
+    else:
+        rows = [_predict_one(path, model, is_fast) for path in paths]
     frame = pd.DataFrame(rows, columns=["ID", "answer", "_probability", "_uncertainty"])
     return frame[["ID", "answer"]]
 

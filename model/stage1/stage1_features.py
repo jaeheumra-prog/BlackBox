@@ -136,23 +136,20 @@ def decode_stratified_views(
     unique = sorted(set(int(index) for index in positions.ravel()))
     decoded_by_index: dict[int, np.ndarray] = {}
 
-    if total <= 300:
-        for index in unique:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, frame = capture.read()
-            if ok:
-                decoded_by_index[index] = frame
-    else:
-        wanted = set(unique)
-        index = 0
-        while index < total and wanted:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            if index in wanted:
-                decoded_by_index[index] = frame
-                wanted.remove(index)
-            index += 1
+    # Repeated MP4 seeks can be much slower than one sequential decode because
+    # each seek may restart from a keyframe.  Decode the stream once for every
+    # known frame count and retain only the requested indices; this is faster
+    # for both short clips and the long 10-Hz driving videos used in Stage 3.
+    wanted = set(unique)
+    index = 0
+    while index < total and wanted:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        if index in wanted:
+            decoded_by_index[index] = frame
+            wanted.remove(index)
+        index += 1
     capture.release()
 
     if not decoded_by_index:
@@ -275,6 +272,21 @@ def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
     # 이 함수가 Stage 1의 핵심이다.
     # RGB 원본을 그대로 학습하지 않고, 재촬영에서 변하기 쉬운 밝기·색차·
     # 고주파 잔차·주기성(FFT)을 수치 특징으로 바꾼다.
+    features = _single_patch_base_features(patch_bgr)
+    patch = patch_bgr.astype(np.float32) / 255.0
+    b, g, r = cv2.split(patch)
+    y = 0.114 * b + 0.587 * g + 0.299 * r
+    rg = r - g
+    bg = b - g
+    features.extend(_spectral_metrics(y, fft_size))
+    features.extend(_spectral_metrics(rg, fft_size)[1::3])
+    features.extend(_spectral_metrics(bg, fft_size)[1::3])
+    return np.nan_to_num(np.asarray(features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _single_patch_base_features(patch_bgr: np.ndarray) -> list[float]:
+    """Compute the non-FFT part of the per-patch forensic descriptor."""
+
     patch = patch_bgr.astype(np.float32) / 255.0
     b, g, r = cv2.split(patch)
     y = 0.114 * b + 0.587 * g + 0.299 * r
@@ -321,10 +333,7 @@ def _single_patch_features(patch_bgr: np.ndarray, fft_size: int) -> np.ndarray:
     rg_high = rg - cv2.GaussianBlur(rg, (0, 0), 1.2)
     correlation = np.corrcoef(rb_high.ravel(), rg_high.ravel())[0, 1]
     features.append(float(correlation) if np.isfinite(correlation) else 0.0)
-    features.extend(_spectral_metrics(y, fft_size))
-    features.extend(_spectral_metrics(rg, fft_size)[1::3])
-    features.extend(_spectral_metrics(bg, fft_size)[1::3])
-    return np.nan_to_num(np.asarray(features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    return features
 
 
 def _frame_features(frame: np.ndarray, config: FeatureConfig) -> np.ndarray:
