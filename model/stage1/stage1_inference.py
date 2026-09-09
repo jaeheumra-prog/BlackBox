@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,7 @@ def _fast_probability(path: Path, model: Stage1ForensicEnsemble):
 
 
 def _predict_one(path: Path, model: Stage1ForensicEnsemble, is_fast: bool):
+    started = time.perf_counter()
     try:
         if is_fast:
             probability, uncertainty = _fast_probability(path, model)
@@ -91,11 +93,13 @@ def _predict_one(path: Path, model: Stage1ForensicEnsemble, is_fast: bool):
             _, aggregate = extract_video(path, replace(model.config, frames=min(model.config.frames, 2), patches=1))
             probability, uncertainty = model.probability(aggregate)
         answer = "RERECORDED" if probability >= model.threshold else "ORIGINAL"
-    except Exception:
+    except Exception as exc:
+        print(f"[stage1] video={path.name} fallback=RERECORDED error={exc!r}", flush=True)
         # A corrupt/unsupported video cannot establish direct-capture
         # authenticity.  Keep the submission alive and choose the conservative
         # fallback used by the original sequential implementation.
         probability, uncertainty, answer = 1.0, 0.0, "RERECORDED"
+    print(f"[stage1] video={path.name} seconds={time.perf_counter()-started:.2f}", flush=True)
     return {
         "ID": path.stem,
         "answer": answer,

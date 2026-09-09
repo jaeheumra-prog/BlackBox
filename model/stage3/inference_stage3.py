@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import os
+import time
 
 import cv2
 import numpy as np
@@ -88,8 +92,9 @@ def _flow_features(previous: np.ndarray, current: np.ndarray) -> dict[str, float
     }
 
 
-def _extract_motion(video_path: Path, width: int = 320) -> np.ndarray:
-    capture = cv2.VideoCapture(str(video_path))
+def _extract_motion(video_path: Path, width: int = 320, workers: int | None = None) -> np.ndarray:
+    # OpenCV's image-operation thread limit does not limit FFmpeg decoders.
+    capture = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open Stage 3 video: {video_path.name}")
     records = []
@@ -99,19 +104,27 @@ def _extract_motion(video_path: Path, width: int = 320) -> np.ndarray:
         "flow_mag_p90", "bottom_mag_p75", "left_mag_median", "right_mag_median",
         "affine_tx", "affine_ty", "divergence", "rotation",
     )
+    workers = min(4 if workers is None else max(1, workers), max(1, os.cpu_count() or 1))
+    pending = deque()
+    # Optical flow depends on a pair of images, not the preceding flow result.
+    # Bound the queue so a long video retains at most a few small ROIs.
     try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            height = round(frame.shape[0] * width / frame.shape[1])
-            gray = cv2.cvtColor(cv2.resize(frame, (width, height)), cv2.COLOR_BGR2GRAY)
-            roi = gray[int(height * 0.36) : int(height * 0.90), int(width * 0.04) : int(width * 0.96)]
-            records.append(
-                {name: 0.0 for name in zero_names}
-                if previous is None else _flow_features(previous, roi)
-            )
-            previous = roi
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                height = round(frame.shape[0] * width / frame.shape[1])
+                gray = cv2.cvtColor(cv2.resize(frame, (width, height)), cv2.COLOR_BGR2GRAY)
+                roi = gray[int(height * 0.36) : int(height * 0.90), int(width * 0.04) : int(width * 0.96)].copy()
+                if previous is None:
+                    records.append({name: 0.0 for name in zero_names})
+                else:
+                    pending.append(executor.submit(_flow_features, previous, roi))
+                previous = roi
+                if len(pending) >= workers * 2:
+                    records.append(pending.popleft().result())
+            records.extend(future.result() for future in pending)
     finally:
         capture.release()
     if not records:
@@ -167,9 +180,23 @@ def predict_stage3(data_dir, model_dir):
         raise ValueError("Stage 3 motion extraction width is implausibly small")
     rows = []
 
-    with torch.inference_mode():
-        for video_path in _video_paths(Path(data_dir) / "videos"):
-            motion = (_extract_motion(video_path, width=motion_width) - mean) / std
+    paths = _video_paths(Path(data_dir) / "videos")
+    video_workers = min(2, max(1, os.cpu_count() or 1), len(paths) or 1)
+    flow_workers = max(1, min(4, os.cpu_count() or 1) // video_workers)
+    # At most two independent videos are decoded ahead. Their normalization,
+    # rolling windows and GRU contexts remain strictly separate.
+    with torch.inference_mode(), ThreadPoolExecutor(max_workers=video_workers) as decoder:
+        pending = deque(
+            decoder.submit(_extract_motion, path, motion_width, flow_workers)
+            for path in paths[:video_workers]
+        )
+        for video_index, video_path in enumerate(paths):
+            started = time.perf_counter()
+            raw_motion = pending.popleft().result()
+            next_index = video_index + video_workers
+            if next_index < len(paths):
+                pending.append(decoder.submit(_extract_motion, paths[next_index], motion_width, flow_workers))
+            motion = (raw_motion - mean) / std
             frame_count = len(motion)
             offsets = np.arange(context - 1, -1, -1)
             accel_parts, steer_parts = [], []
@@ -180,6 +207,7 @@ def predict_stage3(data_dir, model_dir):
                 accel_logits, steer_logits = model(batch)
                 accel_parts.append(torch.softmax(accel_logits, 1).cpu().numpy())
                 steer_parts.append(torch.softmax(steer_logits, 1).cpu().numpy())
+            print(f"[stage3] video={video_path.name} frames={frame_count} wait_and_infer_seconds={time.perf_counter()-started:.2f}", flush=True)
             accel_probability = _smooth(np.concatenate(accel_parts), 11)
             steer_probability = _smooth(np.concatenate(steer_parts), 11)
             accel_prediction = np.asarray(ACCEL_LABELS)[accel_probability.argmax(axis=1)]

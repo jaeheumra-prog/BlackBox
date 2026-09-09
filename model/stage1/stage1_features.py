@@ -37,6 +37,8 @@ def _open_capture(path: Path) -> cv2.VideoCapture:
         VIDEO_OPEN_TIMEOUT_MSEC,
         cv2.CAP_PROP_READ_TIMEOUT_MSEC,
         VIDEO_READ_TIMEOUT_MSEC,
+        cv2.CAP_PROP_N_THREADS,
+        1,
     ]
     try:
         capture = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, params)
@@ -100,11 +102,12 @@ def decode_uniform(path: str | Path, count: int = 24) -> list[np.ndarray]:
         wanted_set = set(int(index) for index in wanted)
         index = 0
         while index < total and wanted_set:
-            ok, frame = capture.read()
-            if not ok:
+            if not capture.grab():
                 break
             if index in wanted_set:
-                frames.append(frame)
+                ok, frame = capture.retrieve()
+                if ok:
+                    frames.append(frame)
                 wanted_set.remove(index)
             index += 1
     else:
@@ -171,11 +174,14 @@ def decode_stratified_views(
         wanted = set(unique)
         index = 0
         while index < total and wanted:
-            ok, frame = capture.read()
-            if not ok:
+            # grab still decodes inter-frame dependencies, but avoids BGR
+            # conversion/allocation for every unselected full-resolution frame.
+            if not capture.grab():
                 break
             if index in wanted:
-                decoded_by_index[index] = frame
+                ok, frame = capture.retrieve()
+                if ok:
+                    decoded_by_index[index] = frame
                 wanted.remove(index)
             index += 1
     else:

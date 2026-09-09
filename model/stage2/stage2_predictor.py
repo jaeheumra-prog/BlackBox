@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 import sys
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,13 +62,13 @@ def _collision_score_gray(gray: list[np.ndarray]) -> np.ndarray:
     laplacian = np.array([cv2.Laplacian(f, cv2.CV_32F).var() for f in gray])
     shifts: list[np.ndarray] = [np.zeros(2, dtype=np.float32)]
 
-    for index in range(1, count):
+    def transition(index):
         previous, current = gray[index - 1], gray[index]
         shift, _ = cv2.phaseCorrelate(previous.astype(np.float32), current.astype(np.float32))
         dx, dy = float(shift[0]), float(shift[1])
         if abs(dx) > previous.shape[1] * 0.2 or abs(dy) > previous.shape[0] * 0.2:
             dx = dy = 0.0
-        shifts.append(np.array([dx, dy], dtype=np.float32))
+        shift_value = np.array([dx, dy], dtype=np.float32)
         transform = np.float32([[1, 0, dx], [0, 1, dy]])
         aligned = cv2.warpAffine(
             previous,
@@ -74,14 +77,22 @@ def _collision_score_gray(gray: list[np.ndarray]) -> np.ndarray:
             borderMode=cv2.BORDER_REFLECT,
         )
         difference = cv2.absdiff(aligned, current)[current.shape[0] // 5 :]
-        residual[index] = float(np.percentile(difference, 75))
+        residual_value = float(np.percentile(difference, 75))
         flow = cv2.calcOpticalFlowFarneback(
             previous, current, None, 0.5, 3, 15, 3, 5, 1.2, 0
         )
         magnitude = np.linalg.norm(flow, axis=2)[flow.shape[0] // 4 :]
-        flow_p90[index] = float(np.percentile(magnitude, 90))
-        flow_spread[index] = float(np.percentile(magnitude, 90) - np.median(magnitude))
-        blur_drop[index] = max(0.0, float(laplacian[index - 1] - laplacian[index]))
+        p90 = np.percentile(magnitude, 90)
+        p90_value = float(p90)
+        spread_value = float(p90 - np.median(magnitude))
+        blur_value = max(0.0, float(laplacian[index - 1] - laplacian[index]))
+
+        return shift_value, residual_value, p90_value, spread_value, blur_value
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, os.cpu_count() or 1))) as executor:
+        for index, values in enumerate(executor.map(transition, range(1, count)), 1):
+            shift_value, residual[index], flow_p90[index], flow_spread[index], blur_drop[index] = values
+            shifts.append(shift_value)
 
     shift_array = np.vstack(shifts)
     shift_jerk[2:] = np.linalg.norm(np.diff(shift_array, n=2, axis=0), axis=1)
@@ -118,23 +129,31 @@ def collision_score(frames_bgr: list[np.ndarray], working_width: int = 320) -> n
 def collision_score_from_paths(
     paths: list[Path], working_width: int = 320
 ) -> tuple[list[Path], np.ndarray]:
-    valid_paths: list[Path] = []
-    gray: list[np.ndarray] = []
-    working_height: int | None = None
-    for path in paths:
+    def read_small(path):
         image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if image is None:
-            continue
-        if working_height is None:
-            working_height = max(1, round(image.shape[0] * working_width / image.shape[1]))
-        gray.append(
-            cv2.resize(
-                image,
-                (working_width, working_height),
-                interpolation=cv2.INTER_AREA,
-            )
-        )
-        valid_paths.append(path)
+            return path, None
+        target_height = max(1, round(image.shape[0] * working_width / image.shape[1]))
+        return path, cv2.resize(image, (working_width, target_height), interpolation=cv2.INTER_AREA)
+
+    # Return only small gray frames from workers; full-resolution images are
+    # released there. Most folders have one resolution. Use the exact original
+    # resize for a differing aspect ratio to avoid a second interpolation.
+    valid_paths, gray = [], []
+    working_height = None
+    with ThreadPoolExecutor(max_workers=min(4, max(1, os.cpu_count() or 1))) as executor:
+        for path, small in executor.map(read_small, paths):
+            if small is None:
+                continue
+            if working_height is None:
+                working_height = small.shape[0]
+            if small.shape[0] != working_height:
+                image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    continue
+                small = cv2.resize(image, (working_width, working_height), interpolation=cv2.INTER_AREA)
+            valid_paths.append(path)
+            gray.append(small)
     return valid_paths, _collision_score_gray(gray)
 
 
@@ -205,8 +224,11 @@ def _restore_mask(
     height: int,
 ) -> np.ndarray:
     _, pad_x, pad_y, resized_width, resized_height = geometry
-    cropped = output[:, :, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width]
-    mask = np.argmax(cropped, axis=1)[0].astype(np.uint8)
+    if output.ndim == 2:
+        mask = output[pad_y : pad_y + resized_height, pad_x : pad_x + resized_width]
+    else:
+        cropped = output[:, :, pad_y : pad_y + resized_height, pad_x : pad_x + resized_width]
+        mask = np.argmax(cropped, axis=1)[0].astype(np.uint8)
     return cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
@@ -346,7 +368,7 @@ class YoloPBackend:
         self.use_half = self.device.type == "cuda"
         if self.use_half:
             self.model.half()
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
         warmup = torch.zeros(
             (1, 3, size, size),
             device=self.device,
@@ -391,8 +413,10 @@ class YoloPBackend:
             conf_thres=confidence_threshold,
             iou_thres=0.45,
         )
-        drivable_output = drivable_tensor.float().cpu().numpy()
-        lane_output = lane_tensor.float().cpu().numpy()
+        # Two FP32 channels cost 8 bytes/pixel; the final class needs one.
+        # Argmax commutes with cropping and preserves the class-0 tie rule.
+        drivable_output = drivable_tensor.argmax(dim=1).to(torch.uint8).cpu().numpy()
+        lane_output = lane_tensor.argmax(dim=1).to(torch.uint8).cpu().numpy()
         results: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         for index, (frame, (_, geometry)) in enumerate(zip(frames, prepared)):
             height, width = frame.shape[:2]
@@ -406,9 +430,9 @@ class YoloPBackend:
                 heights = boxes[:, 3] - boxes[:, 1]
                 boxes = boxes[(widths >= 6) & (heights >= 6)]
             drivable = _restore_mask(
-                drivable_output[index : index + 1], geometry, width, height
+                drivable_output[index], geometry, width, height
             )
-            lane = _restore_mask(lane_output[index : index + 1], geometry, width, height)
+            lane = _restore_mask(lane_output[index], geometry, width, height)
             results.append((boxes, drivable, lane))
         return results
 
@@ -582,6 +606,7 @@ def infer_evasion(
     drivable_mask: np.ndarray | None,
     width: int,
     height: int,
+    tracks: list[Track] | None = None,
 ) -> tuple[int, dict[str, float]]:
     if victim is None or not victim.records:
         return 0, {"reason": 0.0}
@@ -591,6 +616,38 @@ def infer_evasion(
     obstacle_width = max(1.0, x2 - x1)
     left_gap = max(0.0, x1 - road_left)
     right_gap = max(0.0, road_right - x2)
+    # A gap beside the selected victim is not truly evasive if a second,
+    # persistent vehicle occupies that same lateral corridor.  Only use a
+    # nearby record with a meaningful vertical overlap; this keeps distant or
+    # one-frame false detections from changing the established output.
+    blocking_obstacles = 0
+    if tracks:
+        victim_bottom = y2
+        for track in tracks:
+            if track is victim or not track.records:
+                continue
+            candidates = [
+                item for item in track.records
+                if abs(item.frame_index - collision_index) <= 2
+            ]
+            if not candidates:
+                continue
+            other = min(candidates, key=lambda item: abs(item.frame_index - collision_index))
+            ox1, oy1, ox2, oy2 = (float(value) for value in other.box)
+            # Require the obstacle to be on the same road depth as the victim.
+            if oy2 < victim_bottom - 0.16 * height or oy1 > victim_bottom + 0.10 * height:
+                continue
+            pad = 0.02 * width
+            ox1 = max(road_left, ox1 - pad)
+            ox2 = min(road_right, ox2 + pad)
+            if ox2 <= road_left or ox1 >= road_right:
+                continue
+            if ox2 <= x1:
+                left_gap = min(left_gap, max(0.0, ox1 - road_left))
+                blocking_obstacles += 1
+            elif ox1 >= x2:
+                right_gap = min(right_gap, max(0.0, road_right - ox2))
+                blocking_obstacles += 1
     required = max(0.16 * width, 0.72 * obstacle_width)
     available = int(max(left_gap, right_gap) >= required)
     return available, {
@@ -599,6 +656,7 @@ def infer_evasion(
         "left_gap": left_gap,
         "right_gap": right_gap,
         "required_gap": required,
+        "blocking_obstacles": float(blocking_obstacles),
     }
 
 
@@ -692,7 +750,7 @@ class Stage2Predictor:
             victim, collision_index, len(paths), width, height
         )
         evasion_space, evasion_debug = infer_evasion(
-            victim, collision_index, collision_mask, width, height
+            victim, collision_index, collision_mask, width, height, tracker.tracks
         )
         temporal_entry_views: list[dict[str, object]] = []
         if victim is not None:
@@ -730,7 +788,7 @@ class Stage2Predictor:
         temporal_evasion_views: list[dict[str, object]] = []
         for view_index, view_mask in sorted(impact_masks.items()):
             view_label, view_debug = infer_evasion(
-                victim, view_index, view_mask, width, height
+                victim, view_index, view_mask, width, height, tracker.tracks
             )
             view_margin = float(
                 max(
@@ -838,7 +896,14 @@ class Stage2Predictor:
         if not image_root.is_dir():
             raise FileNotFoundError(f"Stage 2 image directory not found: {image_root}")
         folders = sorted(path for path in image_root.iterdir() if path.is_dir())
-        rows = [self.predict_folder(folder)[0] for folder in folders]
+        rows = []
+        for folder in folders:
+            started = time.perf_counter()
+            row, debug = self.predict_folder(folder)
+            rows.append(row)
+            print(f"[stage2] folder={folder.name} frames={debug['frame_count']} "
+                  f"yolop_frames={debug['runtime']['processed_frames']} "
+                  f"seconds={time.perf_counter()-started:.2f}", flush=True)
         return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
 
 
